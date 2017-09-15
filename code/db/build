@@ -1,0 +1,1 @@
+g++ test5.cpp  MyField.cpp MyDatabase.cpp MyParamBinder.cpp MyRecord.cpp MyRecordset.cpp ../BaseCode.cpp ../MyThread.cpp -o test5 -lmysqlclient -lpthread -g

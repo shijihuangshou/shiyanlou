@@ -1,0 +1,15 @@
+test5.cpp: In function ‘int main()’:
+test5.cpp:6:42: error: invalid new-expression of abstract class type ‘CMyDatabase’
+  CMyDatabase* database = new CMyDatabase();
+                                          ^
+In file included from MyDb.h:8:0,
+                 from test5.cpp:2:
+MyDatabase.h:83:7: note:   because the following virtual functions are pure within ‘CMyDatabase’:
+ class CMyDatabase: public IMyDatabase,IThreadEvent
+       ^
+In file included from MyDatabase.h:6:0,
+                 from MyDb.h:8,
+                 from test5.cpp:2:
+../MyThread.h:20:14: note: 	virtual int IThreadEvent::OnThreadDestroy()
+  virtual int OnThreadDestroy(void) = 0;
+              ^

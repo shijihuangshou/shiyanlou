@@ -1,0 +1,1 @@
+g++ test.cpp lua_tinker/lua_tinker.cpp -o test1 -l lua -ldl -std=c++11

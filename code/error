@@ -1,0 +1,2 @@
+nginx: [emerg] invalid number of arguments in "fastcgi_param" directive in /etc/nginx/sites-enabled/default:65
+nginx: configuration file /etc/nginx/nginx.conf test failed

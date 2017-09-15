@@ -1,0 +1,451 @@
+skynet
+17/1/4
+
+1.skynet启动需要一个配置文件来启动
+2.调度处理多个lua虚拟机。接受，处理，发送虚拟机消息
+利用lua虚拟机的相互隔离。。外部网络消息以及定时器管理
+3.分为网络层（建立tcp链接），调度层，隔离lua虚拟机，网关服务用于监听端口，建立链接用
+4.每个服务都有32bit的服务id，由skynet的框架分配，作为服务地址来使用
+5.可以自定义封包协议
+6.服务运行的三个阶段：加载服务的源文件不能调用阻塞的skynet api 初始化能调用任何skynetapi但初始化
+后返回。工作阶段，注册了消息处理函数的，有消息输入就会触发处理函数，这都是内部消息。外部
+消息会通过定时器以内部消息的形式表现出来
+7.服务会等待消息返回的时候挂起，挂起的时候还能处理消息，一个服务可以拥有多个业务线来处理
+看似并行，其实只是轮流工作
+8.没有令牌，非抢占式，所以并不会挂起长时间占用控制权的线程。
+9.每条 skynet 消息由 6 部分构成：消息类型、session 、发起服务地址 、接收服务地址 、消息 C 指针、消息长度。
+需要开发者关心的有：回应消息、网络消息、调试消息、文本消息、Lua 消息、错误。
+10.真正的业务逻辑是由文本类消息和 Lua 类消息驱动的。
+直接使用 C 编写的服务处理，它就是简单字节串，lua类消息可以序列化 Lua 的复杂数据类型
+11.接管消息会调用回调函数，会接受到消息以及地址，session。一般不关心地址和session
+因为会通过sky.ret和sky.response来回应
+
+
+17/1/5
+1. skynet.newservice() 用于启动一个lua写的服务，省略掉.lua后缀名。
+它调用了skynet.call() 然后skynet.call()调用
+luaclib-src/lua_skynet.c里面的send()，最终调用Skynet的框架skynet_send()压入队列。
+
+2. skynet.call()用于发送一条消息给Skynet的框架。消息会压入队列，等待Skynet框架的调度。
+
+3. skynet.start()用于服务的入口，加载lua服务时先运行这里的代码，
+它调用了luaclib-src/lua_skynet.c里面的callback()，
+最终调用Skynet的框架skynet_callback()来设置回调函数。
+
+4.skynet.exit()移除服务，通过skynet.send()发送一条消息给Skynet框架来移除lua的这个服务。  
+
+5.skynet.monitor() 用于监视服务，看它是否关闭。
+
+6.skynet.dispatch回调函数 skynet.ret 返回结果用的？
+
+7.启动在skynet-src/skynet_main.c 这个是main()函数所在，主要就是设置一下lua的环境、默认的配置、
+打开config配置文件，并修改默认配置。最后调用skynet_start()函数，这个函数在skynet_start.c文件中。
+
+8.是skynet-src/skynet_start.c这个文件主要是初始化Skynet的各个模块，包括harbor节点(节点编号,用于多节点用)、handle服务ID、
+mq消息队列、module加载动态链接库、timer时钟、socket套接字以及加载一些服务logger日志服务、
+master主服务、harbor节点服务、snlua 加载lua模块的服务
+
+2017/01/06
+1.包含三个主要要素:handle 上下文 消息队列
+
+2.mq消息队列：
+static struct global_queue *Q  用来管理所有消息队列的消息队列，自带锁
+message_queue 是消息队列 有message_queue指针指向下一个，skynet_message就是具体的skynet消息
+message_queue是一个数组，一个环形数组。不够容量的时候会增大一倍
+
+3.modules组件
+加载动态库用的,全局类,管理一系列skynet_module,MAX_MODULE_TYPE等于32
+struct modules {
+	int count;
+	struct spinlock lock;
+	const char * path;
+	struct skynet_module m[MAX_MODULE_TYPE];
+};
+这个是加载动态库的实际类,module指向dlopen打开的动态库,
+例如mod->create = dlsym(mod->module, tmp);就是找到动态库里具体某个函数的具体位置
+struct skynet_module {
+	const char * name;
+	void * module;
+	skynet_dl_create create;
+	skynet_dl_init init;
+	skynet_dl_release release;
+	skynet_dl_signal signal;
+};
+
+4.读写锁:
+没定义USE_PTHREAD_LOCK时候通过,来实现
+struct rwlock {
+	int write;
+	int read;
+};
+读锁等待write不为1 while(lock->write) {__sync_synchronize();} 
+尝试将__sync_add_and_fetch(&lock->read,1); read加1,如果read加1发现write不为1,减1,继续循环
+写锁尝试,将write加1,并查看返回旧值是否为0,while (__sync_lock_test_and_set(&lock->write,1)) {}
+并等待lock->read 为0 while(lock->read) {__sync_synchronize();}
+解锁写锁 __sync_lock_release(&lock->write); 读锁 __sync_sub_and_fetch(&lock->read,1);
+
+使用USE_PTHREAD_LOCK
+pthread_rwlock_t lock; 
+初始化pthread_rwlock_init(&lock->lock, NULL);
+加读锁pthread_rwlock_rdlock(&lock->lock);
+加写锁pthread_rwlock_wrlock(&lock->lock);
+解锁pthread_rwlock_unlock(&lock->lock);
+
+2017/01/07
+timer主类 link_list 是timer_node的一个链表
+
+struct link_list {
+	struct timer_node head;
+	struct timer_node *tail;
+};
+
+struct timer_event {
+	uint32_t handle; //对应context的handle
+	int session; //对应context的session
+};
+
+struct timer {
+	struct link_list near[TIME_NEAR]; //TIME_NEAR_MASK(1<<8 -1)  
+			//time | TIME_NEAR_MASK == expire | TIME_NEAR_MASK的放入这个链表
+	struct link_list t[4][TIME_LEVEL]; // TIME_LEVEL(1<<6)  TIME_LEVEL_SHIFT 6 TIME_NEAR_SHIFT 8
+	// mask = TIME_NEAR_SHIFT << i*TIME_LEVEL_SHIFT
+	//time | (mask-1) == expire | (mask-1) 的将timenode放入去t[i][(time>>(TIME_NEAR_SHIFT+i*TIME_LEVEL_SHIFT))&(TIME_LEVEL-1)]
+	//near是比较高24位相等的时间，然后按8位放入，linklist是比较高18,12,6位相等的
+	struct spinlock lock;
+	uint32_t time; //用来比较的时间，（怎么来的。。），处理一次加1，经过了多少时间？
+	uint32_t starttime; //现在的时间，秒部分 跟 current 并用
+	uint64_t current; //毫秒部分
+	uint64_t current_point; //时间，毫秒（starttime合并起来用毫秒表示）
+};
+
+struct timer_node {
+	struct timer_node *next;
+	uint32_t expire; //用来跟timer.time比较的时间
+};
+
+time_add timer_node 会分配多一份内存来在node后面存放time_event
+
+skynet_updatetime比较现在的时间和TI里面的时间，然后算出diff（cp-TI->current_point）
+diff大于0，然后执行diff次time_update
+
+time_update 执行timer_execute来处理已经time_out（其实是near链表里面的） time_node里面的time_event再执行timer_shift
+time_shift TI->time在这里自增，将t[4][TIME_LEVEL]根据timer的数值不同进行迁移再执行一次timer_execute
+time_execute会调用dispatch_list 处理time_event,会根据time_event的handle和session来创建消息然后将skynet_context_push
+
+2017/01/09
+网络层，poll.h linux的实现在epoll.h 上
+数据放在，在sp_wait中的epoll_wait决定read为true，还是write为true
+struct event {
+	void * s;
+	bool read;
+	bool write;
+};
+
+struct socket_server {
+	int recvctrl_fd; //接受数据 fd ctrl_cmd函数先读出header（包括type和len）再读出buffer？（内部消息）（管道）
+	int sendctrl_fd; //发送用fd（内部消息）（管道）
+	int checkctrl;
+	poll_fd event_fd;  //epoll
+	int alloc_id;
+	int event_n; //返回epoll就绪事件的数量
+	int event_index;
+	struct socket_object_interface soi; //三个函数 buffer size free send_socket中处理send_socket中的消息
+	struct event ev[MAX_EVENT]; //epoll 就绪具体的event
+	struct socket slot[MAX_SOCKET]; //初始化slot
+	char buffer[MAX_INFO];  //十进制ip地址
+	uint8_t udpbuffer[MAX_UDP_PACKAGE];
+	fd_set rfds; //has_cmd，用来select检察读句柄 FD_SET(ss->recvctrl_fd, &ss->rfds);
+};
+
+struct socket {
+	uintptr_t opaque;  //对应context的handle，用来寻找对应的context
+	struct wb_list high;  //读写的buffer 优先度高的链表
+	struct wb_list low;  //优先度低的链表
+	int64_t wb_size;
+	int fd; //socket fd
+	int id;
+	uint16_t protocol;
+	uint16_t type; 
+	union {
+		int size;
+		uint8_t udp_address[UDP_ADDRESS_SIZE];
+	} p;
+};
+
+//返回消息start_socket ，close_socket 等一系列的返回消息
+struct socket_message {
+	int id;
+	uintptr_t opaque;
+	int ud;	// for accept, ud is new connection id ; for data, ud is size of data 
+	char * data; //返回状态？
+};
+
+
+socket_server_poll -->ctrl_cmd 从recvctrl_fd的上读出消息，按照head的type处理（sbl等）对socket进行处理（在socket type标注）
+					//start_socket: SOCKET_TYPE_PACCEPT -->SOCKET_TYPE_CONNECTED  SOCKET_TYPE_PLISTEN-->SOCKET_TYPE_LISTEN
+					//bind_socket: SOCKET_TYPE_BIND 创建一个socket然后跟epoll绑定
+					//listen_socket: SOCKET_TYPE_PLISTEN 创建一个socket，但不绑定epoll
+					//close_socket:先将所有的消息发出去，再根据是否shutdown来全关闭还是半关闭
+					//SOCKET_TYPE_INVALID
+					//send_buffer 先将高优先度的list写入fd中，再将低优先度的list读出，最后看low的读完没，没有的将low放入high中，
+					//发送完之后如果是HALF_SHUTDOWN状态就关闭
+					//open_socket:根据地址，先connect，再创建一个socket再跟epoll绑定，connect的status==0为SOCKET_TYPE_CONNECTED 
+					//非0为SOCKET_TYPE_CONNECTING
+					//send_socket将放在消息放在socket high或者low中append_sendbuffer
+					//处理内部消息
+
+在处理epoll的事件ev[MAX_EVENT] SOCKET_TYPE_CONNECTING：连接事件设置 socket_server 的 buffer（ip地址），将fd跟epoll关联 只EPOLLIN
+SOCKET_TYPE_LISTEN accept接受然后创建一个socket，设置socket_server 的 buffer（ip地址）
+read事件forward_message_tcp，从socket读出通过 socket_message返回
+write事件 send_buffer先将高优先度的list写入fd中，再将低优先度的list读出，最后看low的读完没，没有的将low放入high中，发送完之后如果是HALF_SHUTDOWN状态就关闭
+
+
+send_request  request->header[6] = (uint8_t)type; request->header[7] = (uint8_t)len; header的七八位作为类型和长度使用，写入sendctrl_fd，写入也是从第7位开始写
+前六位用来干嘛
+ctrl_cmd 两次调用block_readpipe从recvctrl_fd读入，首先读入type和len，再读出buffer
+
+skynet_socket_poll通过socket_server_poll获得返回消息socket_message再通过forward_message发送到skynet_context_push push到context中去
+
+2017/01/10
+struct handle_name {
+	char * name;
+	uint32_t handle;
+};
+
+struct handle_storage {
+	struct rwlock lock; //读写锁
+
+	uint32_t harbor;
+	uint32_t handle_index; //handle的当前索引
+	int slot_size;  //slot的数量
+	struct skynet_context ** slot;
+	
+	int name_cap;  //cap表示name的空间
+	int name_count; //count表示name的实际数量
+	struct handle_name *name; //初始化两份内存
+};
+对skynet_context进行统一管理
+skynet_handle_register会将skynet_context注册到slot，slot没有空位的时候，会自增一倍
+skynet_handle_retire 删除 slot中的skynet_context 同时删除handle_name符合的name；
+skynet_handle_grab 根据handle取出context
+skynet_handle_findname 根据name二分查找，name是按strcmp排序好的
+_insert_name和_insert_name_before 就是二分插入的过程
+
+struct skynet_context {
+	void * instance;  //skynet_module * mod mod->create
+	struct skynet_module * mod; // skynet_module * mod
+	void * cb_ud; 
+	skynet_cb cb;  //typedef int (*skynet_cb)(struct skynet_context * context, void *ud, int type,
+	// int session, uint32_t source , const void * msg, size_t sz);用于传递消息？ callback函数
+	struct message_queue *queue; //消息队列
+	FILE * logfile;  //log文件
+	uint64_t cpu_cost;	// in microsec cpu调度时间
+	uint64_t cpu_start;	// in microsec cpu使用开始时间
+	char result[32];  //用来返回结果？
+	uint32_t handle; //在handle_storage的索引
+	int session_id;  //创建session的时候是自增的
+	int ref;  //引用数，引用数为0的时候会删除
+	int message_count; //消息数量？
+	bool init;
+	bool endless;	//这个是检查是否长时间占用cpu用的
+	bool profile; //是否统计使用了多少cpu时间，cpu开始时间
+
+	CHECKCALLING_DECL
+};
+skynet_context_new 初始化一下 动态库的引用 mod，调用mod->create一下instance
+初始化消息队列queue，加入全局消息队列中。ref引用数为1
+
+struct skynet_node {
+	int total; //统计context的数量
+	int init;
+	uint32_t monitor_exit;
+	pthread_key_t handle_key; //线程独有变量的key，用来保存当前是什么线程 #define THREAD_WORKER 0 #define THREAD_MAIN 1 #define THREAD_SOCKET 2 #define THREAD_TIMER 3 #define THREAD_MONITOR 4
+	bool profile;	// default is off 
+};
+skynet_globalinit()最先初始化 一个skynet_node的全局变量
+
+
+这些接口是供其他地方调用
+cmd_timeout 是根据时间参数param，param>0就是直接放入time_out列表，param<0直接push context
+cmd_reg 用参数.handle名字来向 handle_storage 插入名字
+cmd_query .handle名字来查找handle
+cmd_name 以 :handleid .name 的形式来向handle_storage插入名字
+cmd_exit 调用 handle_exit
+cmd_kill 以:handleid或.name的形式查找handle然后调用handle_exit
+cmd_launch 以param包括mod的名字和args的参数来创建context
+cmd_getenv 获取环境变量
+cmd_setenv 获取环境变量
+cmd_starttime 获取时间 秒 同时放入context的result
+cmd_abort 删除所有的context skynet_handle_retireall
+cmd_monitor 设置或者获取 skynet_node.monitor_exit
+cmd_stat 根据参数来返回，并放入context的result
+cmd_logon 启动log
+cmd_logoff 删除log
+cmd_signal 调用动态库mod的signal函数
+skynet_command 总的分发处理
+
+_filter_args 过滤器，是否需要复制消息，是否需要新的session？
+skynet_send 先过滤器，然后skynet_harbor_message_isremote 判断是放到harbor还是skynet_context_push
+skynet_sendname 根据名字来发送消息，还是. 和 ：规则
+
+dispatch_message 调用context的注册函数来处理消息
+skynet_context_dispatchall 处理context所有的消息
+skynet_context_message_dispatch 处理指定的，或者从globalmq 取出一个链表q来处理消息，如果globalmq已经为空了直接返回q，否则将q放回mq中然后返回mq的下一个链表
+
+2017/01/11
+内部通用消息
+struct skynet_message {
+	uint32_t source; //消息来源
+	int session; //
+	void * data;
+	size_t sz;  //message类型 type<< MESSAGE_TYPE_SHIFT MESSAGE_TYPE_SHIFT (sizeof(size_t)-1)*8
+};
+
+环境变量
+struct skynet_env {
+	struct spinlock lock;
+	lua_State *L;
+};
+skynet_getenv 其实就是从L里面取出全局变量
+skynet_setenv 设置L里面的变量
+
+/////////////////////////////////////////////////////harbor
+本质也是一个context
+static struct skynet_context * REMOTE = 0;  节点的context
+static unsigned int HARBOR = ~0;  节点的id ， 转换为handler就是 HARBOR << 24 ,也就是说hander高八位的都表示其他harbor
+
+传递的消息为
+struct remote_message {
+	struct remote_name destination;
+	const void * message;
+	size_t sz;
+};
+
+////////////log 配置文件设置log输出路径
+logpath 
+
+////
+skynet_start
+struct skynet_context *ctx = skynet_context_new(config->logservice, config->logger); 根据config的来创建logservice
+然后再根据bootstrap(ctx, config->bootstrap); ctx是logservice，创建一个bootstrap的服务
+
+/////////////////////线程监控用
+struct skynet_monitor {
+	int version;	//当前版本
+	int check_version;	//检查版本
+	uint32_t source;	//
+	uint32_t destination; //某个context的handle
+};
+
+
+struct monitor {
+	int count; //thread是自定义线程的个数
+	struct skynet_monitor ** m; //创建thread个monitor*，
+	pthread_cond_t cond;	//信号
+	pthread_mutex_t mutex;   //互斥
+	int sleep;  //休眠的线程的数量
+	int quit; //是否退出
+};
+至少三个线程thread_monitor，thread_timer，thread_socket都是以monitor为参数，在没有context的时候线程退出
+
+thread_monitor 检查每个线程比较 version 和 check_version,如果相等就说明version没更新，继而检查destination，如果不为null则说明有某个context长时间占用cpu，做出警告
+thread_timer调用skynet_updatetime然后比较现在的实际和TI->current_point 算出diff来进行diff次timer_update，每次执行后usleep(2500)
+然后wakeup(m,m->count-1)，退出线程时pthread_cond_broad(&m->cond)唤醒所有等待线程
+wakeup(struct monitor *m, int busy) {
+	if (m->sleep >= m->count - busy) {
+		// signal sleep worker, "spurious wakeup" is harmless
+		pthread_cond_signal(&m->cond);
+	}
+}
+
+thread_socket 调用了skynet_socket_poll然后wakeup(m,0)，处理内部消息主要通过两个管道，处理网络消息，通过epoll来进行处理
+
+自定义thread 线程的参数为
+struct worker_parm {
+	struct monitor *m;
+	int id;
+	int weight; //weight决定处理消息队列循环的次数n  n = skynet_mq_length(q); n >>= weight;
+};
+//weight的数值一览，线程创建的权值跟第几条创建的线程相关，超过范围为0
+static int weight[] = { 
+		-1, -1, -1, -1, 0, 0, 0, 0,
+		1, 1, 1, 1, 1, 1, 1, 1, 
+		2, 2, 2, 2, 2, 2, 2, 2, 
+		3, 3, 3, 3, 3, 3, 3, 3, };
+线程入口为thread_worker(void *p) 调用的是skynet_context_message_dispatch 因为是队列的参数q为NULL所以会从全局的队列中取出一个来处理
+其中skynet_monitor_trigger(sm, msg.source , handle); 会对skynet_monitor的version，source，destination进行操作
+
+使用mutex进行同步，使用cond进行休眠，这个时候会对monitor的sleep进行数值的增减
+
+2017/01/24
+socket_server.c
+一些函数发送命令到 socket_server 的 sendctrl_fd，命令然后会在 thread_socket 线程中处理ctrl_cmd
+
+//gate
+
+struct connection {
+	int id;	// skynet_socket id
+	uint32_t agent;
+	uint32_t client;
+	char remote_name[32];
+	struct databuffer buffer;
+};
+
+struct gate {
+	struct skynet_context *ctx;
+	int listen_id;
+	uint32_t watchdog;
+	uint32_t broker;
+	int client_tag;
+	int header_size;
+	int max_connection;
+	struct hashid hash;
+	struct connection *conn;
+	// todo: save message pool ptr for release
+	struct messagepool mp;
+};
+
+//Hashid.h
+struct hashid_node {
+	int id;
+	struct hashid_node *next;
+};
+
+struct hashid {
+	int hashmod;  //id数组的最大索引值，id的数量减1，作为mask
+	int cap;  //占用
+	int count;
+	struct hashid_node *id; //一个数组，最小为16，是2的n次幂
+	struct hashid_node **hash;
+};
+// 插入的时候先在id中与cap的余数在id中寻找位置插入（已经占用的时候加1）
+hash是一个hashid_node的链表，新插入的id会跟hashmod 相与，找到hash中相应的位置
+返回的是在id的相对位置，简单来说就是最后插入的hash值在id，找不到的在hash的链表中继续找
+
+
+//databuffer.h
+
+struct message {
+	char * buffer;
+	int size;
+	struct message * next;
+};
+
+//读出来的message会放入messagepool中的freelist中，同时需要创建的时候也是从freelist取
+struct databuffer {
+	int header;
+	int offset;  head链表的偏移位置
+	int size;   //链表所有数据的大小
+	struct message * head; 一个链表
+	struct message * tail;
+};
+
+struct messagepool_list {
+	struct messagepool_list *next;
+	struct message pool[MESSAGEPOOL];
+};
+
+struct messagepool {
+	struct messagepool_list * pool;
+	struct message * freelist; 准备释放的链表 放在这里回收再用的，如果freelist不存在的话，就创建一个同时会插入pool中
+};
